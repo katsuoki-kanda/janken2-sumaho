@@ -1,0 +1,303 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+    <title>Janken Game - High Visibility Edition</title>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+
+    <style>
+        body { 
+            font-family: "Helvetica Neue", Arial, "Hiragino Kaku Gothic ProN", "Hiragino Sans", Meiryo, sans-serif;
+            background: #000; 
+            margin: 0; padding: 0;
+            height: 100dvh; width: 100vw;
+            overflow: hidden; 
+            color: white;
+            display: flex; flex-direction: column;
+            transition: background-color 0.3s ease; /* 背景色変化をスムーズに */
+        }
+        
+        /* 上部UI：スコア、自分の手、タイマー */
+        #header-ui {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 0 20px;
+            background: rgba(17, 17, 17, 0.8);
+            border-bottom: 2px solid #333;
+            height: 70px;
+            z-index: 100;
+            flex-shrink: 0;
+        }
+
+        .ui-item { font-size: 22px; font-weight: bold; }
+        #my-hand-display { font-size: 50px; color: #0f0; }
+        #timer-display { color: #f44; min-width: 60px; text-align: right; }
+
+        /* メイン表示エリア */
+        #game-screen { 
+            flex: 1; 
+            display: flex; 
+            justify-content: center; 
+            align-items: center; 
+            position: relative;
+            overflow: hidden;
+        }
+
+        /* 課題表示コンテナ */
+        #task-container {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            text-align: center;
+            width: 100%;
+        }
+
+        /* 絵文字：横幅いっぱいに拡大 */
+        #task-emoji {
+            font-size: 70vw;
+            line-height: 0.9;
+            margin: 0;
+            display: block;
+        }
+
+        /* アクション文字：絵文字の半分のサイズ */
+        #task-action {
+            font-size: 28vw; 
+            font-weight: 900;
+            line-height: 1;
+            text-shadow: 4px 4px 0px rgba(0,0,0,0.5);
+            margin-top: -10px;
+        }
+
+        /* 縦書きスタイル（開始前・終了後） */
+        .vertical-mode {
+            writing-mode: vertical-rl;
+            text-orientation: upright;
+            font-size: 18vw !important;
+            letter-spacing: 0.1em;
+            line-height: 1.4;
+        }
+        .vertical-mode #task-emoji { display: none; }
+
+        /* 判定用ビデオ（非表示） */
+        video, canvas { display: none; }
+
+        /* 背景色クラス */
+        .hand-detected { background-color: #006400; } /* 暗めの緑（視認性確保） */
+
+        /* 正解エフェクト */
+        .correct-flash {
+            animation: flash 0.4s ease-out;
+        }
+        @keyframes flash {
+            0% { background-color: rgba(255, 255, 255, 0); }
+            50% { background-color: rgba(0, 255, 0, 0.6); }
+            100% { background-color: rgba(255, 255, 255, 0); }
+        }
+    </style>
+</head>
+<body>
+
+<div id="header-ui">
+    <div id="score-display" class="ui-item">Score: 0</div>
+    <div id="my-hand-display" class="ui-item">---</div>
+    <div id="timer-display" class="ui-item">60</div>
+</div>
+
+<div id="game-screen">
+    <div id="task-container" class="vertical-mode">
+        <div id="task-emoji"></div>
+        <div id="task-action">人差し指を立てて</div>
+    </div>
+    <video id="input_video" playsinline muted></video>
+</div>
+
+<script>
+    const body = document.body;
+    const taskContainer = document.getElementById('task-container');
+    const taskEmoji = document.getElementById('task-emoji');
+    const taskAction = document.getElementById('task-action');
+    const scoreText = document.getElementById('score-display');
+    const timerText = document.getElementById('timer-display');
+    const myHandText = document.getElementById('my-hand-display');
+    const gameScreen = document.getElementById('game-screen');
+    const videoElement = document.getElementById('input_video');
+
+    let score = 0, timeLeft = 60, gameStarted = false;
+    let currentTask = 0, previousTaskType = -1; 
+    let lastHandState = -1, gameTimer = null;
+    let isProcessingCorrect = false; 
+    let isPostGameDelay = false, audioCtx = null;
+
+    const taskData = {
+        1: { emoji: "✊", action: "勝って" },
+        2: { emoji: "✋", action: "あいこ" },
+        3: { emoji: "✌️", action: "負けて" },
+        4: { emoji: "✋", action: "勝って" },
+        5: { emoji: "✌️", action: "あいこ" },
+        6: { emoji: "✊", action: "負けて" },
+        7: { emoji: "✌️", action: "勝って" },
+        8: { emoji: "✊", action: "あいこ" },
+        9: { emoji: "✋", action: "負けて" }
+    };
+
+    function speak(text) {
+        if (!window.speechSynthesis) return;
+        window.speechSynthesis.cancel();
+        const uttr = new SpeechSynthesisUtterance(text);
+        uttr.lang = 'ja-JP';
+        window.speechSynthesis.speak(uttr);
+    }
+
+    function playBeep() {
+        if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        const osc = audioCtx.createOscillator();
+        const gain = audioCtx.createGain();
+        osc.connect(gain); gain.connect(audioCtx.destination);
+        osc.frequency.setValueAtTime(880, audioCtx.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + 0.1);
+        osc.start(); osc.stop(audioCtx.currentTime + 0.1);
+    }
+
+    function getTargetHandType(num) {
+        if (num <= 3) return 1; // ✋
+        if (num >= 4 && num <= 6) return 2; // ✌️
+        return 3; // ✊
+    }
+
+    function nextQuestion() {
+        if (!gameStarted) return;
+        let nextT, nextType;
+        do {
+            nextT = Math.floor(Math.random() * 9) + 1;
+            nextType = getTargetHandType(nextT);
+        } while (nextType === previousTaskType);
+        
+        currentTask = nextT;
+        previousTaskType = nextType;
+        lastHandState = -1;
+        
+        taskEmoji.innerText = taskData[currentTask].emoji;
+        taskAction.innerText = taskData[currentTask].action;
+    }
+
+    function onResults(results) {
+        let targetHand = null;
+        const handDetected = results.multiHandLandmarks && results.multiHandLandmarks.length > 0;
+
+        // 背景色のフィードバック（開始前のみ）
+        if (!gameStarted && !isPostGameDelay) {
+            if (handDetected) {
+                body.classList.add('hand-detected');
+            } else {
+                body.classList.remove('hand-detected');
+            }
+        } else {
+            body.classList.remove('hand-detected');
+        }
+
+        if (handDetected) {
+            // 最も手前にある手を取得
+            let highestY = 1.1;
+            for (const lm of results.multiHandLandmarks) {
+                if (lm[0].y < highestY) {
+                    highestY = lm[0].y;
+                    targetHand = lm;
+                }
+            }
+
+            const getDist = (p1, p2) => Math.hypot(p1.x - p2.x, p1.y - p2.y);
+            const wrist = targetHand[0];
+            
+            // 各指の状態（折っているか伸ばしているか）
+            const isI = getDist(targetHand[8], wrist) > getDist(targetHand[6], wrist);  // 人差し指
+            const isM = getDist(targetHand[12], wrist) > getDist(targetHand[10], wrist); // 中指
+            const isR = getDist(targetHand[16], wrist) > getDist(targetHand[14], wrist); // 薬指
+            const isP = getDist(targetHand[20], wrist) > getDist(targetHand[18], wrist); // 小指
+
+            // ゲーム開始判定：人差し指だけを立てている状態 (☝️)
+            if (!gameStarted && !isPostGameDelay) {
+                if (isI && !isM && !isR && !isP) {
+                    startGame();
+                }
+                return;
+            }
+
+            // ジャンケンの種類判定
+            let handType = 0, emoji = "---";
+            if (isI && isM && isR && isP) { handType = 1; emoji = "✋"; }
+            else if (isI && isM && !isR && !isP) { handType = 2; emoji = "✌️"; }
+            else if (!isI && !isM && !isR && !isP) { handType = 3; emoji = "✊"; }
+
+            myHandText.innerText = emoji;
+
+            // 正解判定
+            if (gameStarted && !isProcessingCorrect && handType !== 0) {
+                if (handType === getTargetHandType(currentTask)) {
+                    isProcessingCorrect = true;
+                    score++;
+                    playBeep();
+                    scoreText.innerText = `Score: ${score}`;
+                    gameScreen.classList.add('correct-flash');
+                    
+                    // 0.4秒のガードタイム
+                    setTimeout(() => { 
+                        gameScreen.classList.remove('correct-flash');
+                        isProcessingCorrect = false; 
+                        nextQuestion(); 
+                    }, 400);
+                }
+            }
+        } else {
+            myHandText.innerText = "---";
+        }
+    }
+
+    const hands = new Hands({ locateFile: (f) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${f}` });
+    hands.setOptions({
+        maxNumHands: 1, modelComplexity: 0,
+        minDetectionConfidence: 0.5, minTrackingConfidence: 0.5
+    });
+    hands.onResults(onResults);
+
+    const camera = new Camera(videoElement, {
+        onFrame: async () => { await hands.send({image: videoElement}); },
+        width: 480, height: 640
+    });
+    camera.start();
+
+    function startGame() {
+        if (gameStarted || isPostGameDelay) return;
+        gameStarted = true; score = 0; timeLeft = 60;
+        scoreText.innerText = `Score: ${score}`;
+        taskContainer.classList.remove('vertical-mode');
+        body.classList.remove('hand-detected');
+        speak("スタート");
+        nextQuestion();
+        gameTimer = setInterval(() => {
+            timeLeft--;
+            timerText.innerText = timeLeft;
+            if (timeLeft <= 0) endGame();
+        }, 1000);
+    }
+
+    function endGame() {
+        gameStarted = false; clearInterval(gameTimer);
+        taskEmoji.innerText = "";
+        taskAction.innerText = "終了";
+        taskContainer.classList.add('vertical-mode');
+        speak(`${score}点です。`);
+        isPostGameDelay = true;
+        setTimeout(() => {
+            isPostGameDelay = false;
+            taskAction.innerText = "人差し指を立てて";
+            myHandText.innerText = "---";
+        }, 4000);
+    }
+</script>
+</body>
+</html>
